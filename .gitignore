@@ -1,0 +1,79 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local application state: auth, chats, configuration, plugin caches and backups
+.runtime/
+.codex/
+.secrets/
+secrets/
+backups/
+
+# Environment files; allow sanitized templates
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!.env.sample
+!.env.template
+!*.env.example
+!*.env.sample
+!*.env.template
+
+# Credentials and private keys (including copies outside .runtime)
+auth.json
+credentials.json
+access-token
+access-token.*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.npmrc
+.pypirc
+.netrc
+
+# Session storage and databases
+rollout-*.jsonl
+history.jsonl
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-wal
+*.db-shm
+
+# Logs, process state, local diagnostics and generated test results
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.sock
+*.bak
+*.backup
+/TEST_REPORT.md
+artifacts/
+playwright-report/
+test-results/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
