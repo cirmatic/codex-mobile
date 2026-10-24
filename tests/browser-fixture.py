@@ -1,11 +1,12 @@
 from pathlib import Path
+from urllib.parse import urlencode
 import os, time, json
 from playwright.sync_api import sync_playwright, expect
 base=os.environ.get('TEST_URL','http://127.0.0.1:3031')
 runtime=Path(os.environ.get('TEST_RUNTIME','.runtime/fixture'))
 with sync_playwright() as p:
     browser=p.chromium.launch(headless=True)
-    ctx=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True)
+    ctx=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True,accept_downloads=True)
     page=ctx.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(base,wait_until='networkidle')
     page.screenshot(path='artifacts/login-mobile.png')
@@ -31,8 +32,68 @@ with sync_playwright() as p:
     expect(page.locator('.cwd')).to_contain_text(name)
     expect(page.get_by_role('textbox',name='消息',exact=True)).to_be_disabled()
     expect(page.locator('.thread-link')).to_have_count(0)
+    selected_workspace=Path(page.evaluate("localStorage.getItem('cm-workspace')"))
+    payload='实验结果：42\n'.encode('utf-8')
+    (selected_workspace/'报告.txt').write_bytes(payload)
+    (selected_workspace/'.secret.txt').write_text('blocked')
+    (selected_workspace/'.hidden-dir').mkdir()
+    (selected_workspace/'.hidden-dir'/'inside.txt').write_text('blocked')
+    (selected_workspace/'secret-link').symlink_to('.secret.txt')
+    (selected_workspace/'figures').mkdir()
+    (selected_workspace/'figures'/'plot.txt').write_text('plot')
+    page.get_by_role('button',name='浏览工作区文件').click()
+    file_dialog=page.get_by_role('dialog',name='浏览工作区文件')
+    expect(file_dialog.get_by_role('link',name='下载 报告.txt')).to_be_visible()
+    expect(file_dialog.get_by_text('.secret.txt')).to_have_count(0)
+    expect(file_dialog.get_by_text('.hidden-dir')).to_have_count(0)
+    expect(file_dialog.get_by_text('secret-link')).to_have_count(0)
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'file browser horizontal overflow'
+    page.screenshot(path='artifacts/file-browser-mobile.png')
+    with page.expect_download() as download_info:
+        file_dialog.get_by_role('link',name='下载 报告.txt').click()
+    download=download_info.value
+    assert download.suggested_filename=='报告.txt'
+    assert Path(download.path()).read_bytes()==payload
+    file_dialog.get_by_role('button',name='figures').click()
+    expect(file_dialog.get_by_role('link',name='下载 plot.txt')).to_be_visible()
+    file_dialog.get_by_role('button',name='上一级').click()
+    expect(file_dialog.get_by_role('link',name='下载 报告.txt')).to_be_visible()
+    page.get_by_role('button',name='关闭文件浏览').click()
+    for index in range(105):
+        (selected_workspace/f'zz-scroll-{index:03d}.txt').write_text(str(index))
+    page.get_by_role('button',name='浏览工作区文件').click()
+    expect(file_dialog.locator('.file-row')).to_have_count(100)
+    before_scroll=file_dialog.bounding_box()
+    assert before_scroll['y'] >= 12 and before_scroll['y']+before_scroll['height'] <= 844-12
+    assert before_scroll['height'] <= 680
+    assert page.locator('.file-list').evaluate('(element) => element.scrollHeight > element.clientHeight')
+    page.locator('.file-list').evaluate('(element) => element.scrollTop = element.scrollHeight')
+    expect(file_dialog.get_by_role('link',name='下载 zz-scroll-104.txt')).to_be_visible(timeout=5000)
+    expect(file_dialog.locator('.file-row')).to_have_count(107)
+    last_download=file_dialog.get_by_role('link',name='下载 zz-scroll-104.txt')
+    last_download.scroll_into_view_if_needed()
+    assert page.locator('.file-list').evaluate('(element) => element.scrollTop > 0')
+    assert file_dialog.evaluate('(element) => element.scrollTop')==0
+    after_scroll=file_dialog.bounding_box()
+    assert abs(before_scroll['height']-after_scroll['height']) < 1
+    assert abs(before_scroll['y']-after_scroll['y']) < 1
+    page.screenshot(path='artifacts/file-browser-scrolled-mobile.png')
+    file_dialog.get_by_role('button',name='关闭文件浏览').click()
+    page.get_by_role('button',name='浏览工作区文件').click()
+    expect(file_dialog.locator('.file-row')).to_have_count(100)
+    assert page.locator('.file-list').evaluate('(element) => element.scrollTop')==0
+    page.get_by_role('button',name='关闭文件浏览').click()
+    def file_url(workspace,path):
+        return base+'/api/files/download?'+urlencode({'workspace':str(workspace),'path':path})
+    assert ctx.request.get(file_url(selected_workspace,'报告.txt')).body()==payload
+    for denied in ['.secret.txt','.hidden-dir/inside.txt','secret-link']:
+        assert ctx.request.get(file_url(selected_workspace,denied)).status==403
+    fixture_root=Path(os.environ['TEST_PROJECT_ROOT'])
+    assert ctx.request.get(file_url(fixture_root,'private-note.txt')).status==403
+    assert ctx.request.get(file_url(selected_workspace,'../private-note.txt')).status==400
     page.get_by_role('button',name='在此工作区新建会话').click()
     expect(page.get_by_role('textbox',name='消息',exact=True)).to_be_enabled()
+    expect(page.locator('.conversation-jump')).to_have_count(0)
     model=page.get_by_role('combobox',name='选择模型')
     effort=page.get_by_role('combobox',name='推理强度')
     model.select_option('fixture-model');effort.select_option('high')
@@ -54,6 +115,28 @@ with sync_playwright() as p:
     expect(page.get_by_role('combobox',name='推理强度')).to_have_value('high')
     recorded=json.loads((runtime/'history.json').read_text())[thread_id]
     assert recorded['reasoningEffort']=='high' and recorded['model']=='fixture-model'
+    page.get_by_role('textbox',name='消息',exact=True).fill('长会话测试')
+    page.get_by_role('button',name='发送消息').click()
+    expect(page.locator('.markdown').last).to_contain_text('长会话测试完成',timeout=10000)
+    pane=page.locator('.conversation')
+    assert pane.evaluate('(element) => element.scrollHeight - element.clientHeight > 500')
+    header_y=page.locator('header').bounding_box()['y']
+    composer_y=page.locator('.composer-area').bounding_box()['y']
+    expect(page.get_by_role('button',name='跳转到会话顶部')).to_be_visible()
+    pane.evaluate('(element) => {const max=element.scrollHeight-element.clientHeight; element.scrollTop=max*0.4}')
+    page.wait_for_timeout(100)
+    expect(page.get_by_role('button',name='跳转到会话顶部')).to_be_visible()
+    pane.evaluate('(element) => {const max=element.scrollHeight-element.clientHeight; element.scrollTop=max*0.7}')
+    expect(page.get_by_role('button',name='跳转到最新消息')).to_be_visible()
+    page.screenshot(path='artifacts/jump-button-mobile.png')
+    page.get_by_role('button',name='跳转到最新消息').click()
+    page.wait_for_function("() => {const e=document.querySelector('.conversation'); return e.scrollHeight-e.scrollTop-e.clientHeight < 30}")
+    expect(page.get_by_role('button',name='跳转到会话顶部')).to_be_visible()
+    page.get_by_role('button',name='跳转到会话顶部').click()
+    page.wait_for_function("() => document.querySelector('.conversation').scrollTop < 30")
+    expect(page.get_by_role('button',name='跳转到最新消息')).to_be_visible()
+    assert abs(page.locator('header').bounding_box()['y']-header_y)<1
+    assert abs(page.locator('.composer-area').bounding_box()['y']-composer_y)<1
     page.get_by_role('textbox',name='消息',exact=True).fill('审批测试')
     page.get_by_role('button',name='发送消息').click()
     expect(page.get_by_role('button',name='允许这次')).to_be_visible()
@@ -102,6 +185,8 @@ with sync_playwright() as p:
     assert ctx.request.get(base+'/manifest.webmanifest').status==200
     assert ctx.request.get(base+'/icon-192.png').status==200
     # An unauthorized new browser cannot access the directory list.
-    other=browser.new_context();assert other.request.get(base+'/api/config').status==401;other.close()
-    print(json.dumps({'result':'PASS','checks':['login','directory create/select','streaming Markdown','offline/reconnect','approval reconnect','approve','decline','interrupt','draft persistence','mobile layout','desktop layout','directory boundary','CSRF origin','unauthenticated API','PWA assets'],'threadId':thread_id},ensure_ascii=False))
+    other=browser.new_context();assert other.request.get(base+'/api/config').status==401
+    assert other.request.get(file_url(selected_workspace,'报告.txt')).status==401
+    other.close()
+    print(json.dumps({'result':'PASS','checks':['login','directory create/select','workspace file browsing','authenticated download','hidden and custom denied paths','streaming Markdown','offline/reconnect','approval reconnect','approve','decline','interrupt','draft persistence','mobile layout','desktop layout','directory boundary','CSRF origin','unauthenticated API','PWA assets'],'threadId':thread_id},ensure_ascii=False))
     browser.close()

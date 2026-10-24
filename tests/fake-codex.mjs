@@ -128,6 +128,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
             },
           }) + '\n',
         );
+      } else if (text.includes('长会话')) {
+        for (let i = 0; i < 40; i++) {
+          item(t, turn, {
+            id: crypto.randomUUID(),
+            type: 'agentMessage',
+            text: `历史消息 ${i + 1}\n\n这是用于滚动测试的较长会话内容。`,
+          });
+        }
+        finish(t, turn, '## 长会话测试完成\n\n可以使用快速跳转按钮。');
       } else if (text.includes('等待')) {
         timers.set(
           turn.id,

@@ -4,6 +4,25 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { ThreadState, ThreadSummary, Item, Approval, ModelOption } from '../../shared/types';
 import './style.css';
+type FileEntry = {
+  name: string;
+  path: string;
+  type: 'directory' | 'file';
+  size: number;
+  modifiedMs: number;
+};
+type FileListing = {
+  workspace: string;
+  path: string;
+  parent: string | null;
+  entries: FileEntry[];
+  nextCursor: string | null;
+};
+function fileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 const readLocal = (key: string) => {
   try {
     return localStorage.getItem(key) || '';
@@ -244,6 +263,13 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [picker, setPicker] = useState(false);
   const [dirs, setDirs] = useState<any>({ entries: [] });
+  const [filePicker, setFilePicker] = useState(false);
+  const [fileListing, setFileListing] = useState<FileListing | null>(null);
+  const [fileLoading, setFileLoading] = useState(false);
+  const [fileError, setFileError] = useState('');
+  const fileRequest = useRef(0);
+  const fileListRef = useRef<HTMLDivElement>(null);
+  const filePageLoading = useRef(false);
   const [name, setName] = useState('');
   const [install, setInstall] = useState<any>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -263,6 +289,9 @@ function App() {
   const active = useRef('');
   const scroll = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const previousScrollTop = useRef(0);
+  const [showJump, setShowJump] = useState(false);
+  const [jumpTarget, setJumpTarget] = useState<'top' | 'bottom'>('top');
   const choosing = useRef(false);
   function rpc(action: string, params: unknown = {}): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -315,6 +344,7 @@ function App() {
     preferenceDirty.current = false;
     sync(s);
     stick.current = true;
+    previousScrollTop.current = 0;
   }
   async function open(id: string) {
     const generation = ++navigation.current;
@@ -341,6 +371,10 @@ function App() {
       if (generation !== navigation.current) return;
       workspaceRef.current = cwd;
       setWorkspace(cwd);
+      ++fileRequest.current;
+      filePageLoading.current = false;
+      setFilePicker(false);
+      setFileListing(null);
       saveLocal('cm-workspace', cwd);
       active.current = '';
       setThread(null);
@@ -479,10 +513,51 @@ function App() {
       document.removeEventListener('visibilitychange', visible);
     };
   }, [authed]);
+  function updateJump() {
+    const pane = scroll.current;
+    if (!pane) return;
+    const maxScroll = Math.max(0, pane.scrollHeight - pane.clientHeight);
+    const position = Math.max(0, Math.min(pane.scrollTop, maxScroll));
+    setShowJump(maxScroll > 180);
+    if (position <= 24) {
+      setJumpTarget('bottom');
+      previousScrollTop.current = position;
+    } else if (maxScroll - position <= 24) {
+      setJumpTarget('top');
+      previousScrollTop.current = position;
+    } else if (position - previousScrollTop.current >= 4) {
+      setJumpTarget('bottom');
+      previousScrollTop.current = position;
+    } else if (position - previousScrollTop.current <= -4) {
+      setJumpTarget('top');
+      previousScrollTop.current = position;
+    }
+  }
   useEffect(() => {
-    if (stick.current)
-      scroll.current?.scrollTo({ top: scroll.current.scrollHeight, behavior: 'instant' });
+    const pane = scroll.current;
+    if (!pane) return;
+    if (stick.current) pane.scrollTo({ top: pane.scrollHeight, behavior: 'instant' });
+    updateJump();
   }, [thread]);
+  useEffect(() => {
+    if (!authed || !scroll.current) return;
+    const pane = scroll.current;
+    const observer = new ResizeObserver(updateJump);
+    observer.observe(pane);
+    if (pane.firstElementChild) observer.observe(pane.firstElementChild);
+    updateJump();
+    return () => observer.disconnect();
+  }, [authed]);
+  function jumpConversation() {
+    const pane = scroll.current;
+    if (!pane) return;
+    pane.scrollTo({
+      top: jumpTarget === 'top' ? 0 : pane.scrollHeight,
+      behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ? 'instant'
+        : 'smooth',
+    });
+  }
   async function browse(path?: string, includeHidden = showHidden) {
     try {
       const query = new URLSearchParams();
@@ -494,6 +569,42 @@ function App() {
     } catch (e) {
       setError((e as Error).message);
     }
+  }
+  async function browseFiles(relative = '', more = false) {
+    const cwd = workspaceRef.current;
+    if (!cwd) return;
+    if (more && (filePageLoading.current || !fileListing?.nextCursor)) return;
+    const request = ++fileRequest.current;
+    filePageLoading.current = true;
+    setFilePicker(true);
+    setFileLoading(true);
+    setFileError('');
+    if (!more) {
+      fileListRef.current?.scrollTo({ top: 0 });
+      setFileListing(null);
+    }
+    try {
+      const query = new URLSearchParams({ workspace: cwd, path: relative });
+      if (more && fileListing?.nextCursor) query.set('cursor', fileListing.nextCursor);
+      const result = (await api('/api/files?' + query.toString())) as FileListing;
+      if (request !== fileRequest.current || cwd !== workspaceRef.current) return;
+      setFileListing((previous) =>
+        more && previous && previous.path === relative
+          ? { ...result, entries: [...previous.entries, ...result.entries] }
+          : result,
+      );
+    } catch (e) {
+      if (request === fileRequest.current) setFileError((e as Error).message);
+    } finally {
+      if (request === fileRequest.current) {
+        filePageLoading.current = false;
+        setFileLoading(false);
+      }
+    }
+  }
+  function downloadUrl(relative: string) {
+    const query = new URLSearchParams({ workspace: workspaceRef.current, path: relative });
+    return '/api/files/download?' + query.toString();
   }
   async function create(cwd: string) {
     if (busy) return;
@@ -729,6 +840,14 @@ function App() {
               ⌑ {workspace || '选择工作区'} <span>⌄</span>
             </button>
           </div>
+          <button
+            className="files-trigger"
+            aria-label="浏览工作区文件"
+            disabled={!workspace}
+            onClick={() => browseFiles()}
+          >
+            文件
+          </button>
           <span className={'connection ' + (ready ? 'connected' : '')}>
             <span className={'dot ' + (ready ? 'online' : '')} />
             {ready ? '电脑在线' : '连接中'}
@@ -742,82 +861,95 @@ function App() {
             </button>
           </div>
         )}
-        <div
-          className="conversation"
-          ref={scroll}
-          onScroll={() => {
-            const e = scroll.current;
-            stick.current = !!e && e.scrollHeight - e.scrollTop - e.clientHeight < 100;
-          }}
-        >
-          <div className="conversation-inner">
-            {!thread?.items.length ? (
-              <section className="welcome">
-                <div className="welcome-symbol">✳</div>
-                <div className="eyebrow">灵感不必等到回到电脑前</div>
-                <h1>现在，你想探索什么？</h1>
-                <p>
-                  说出你的想法，让 Codex 在电脑上
-                  <br className="desktop-only" />
-                  调研、写代码，然后把结果带回来。
-                </p>
-                {!thread ? (
-                  <button
-                    className="primary"
-                    disabled={!ready}
-                    onClick={() => (workspace ? create(workspace) : browse())}
-                  >
-                    {workspace ? '在此工作区新建会话' : '选择工作区'} <span>↗</span>
-                  </button>
-                ) : (
-                  <div className="suggestions">
-                    {[
-                      '先看看这个项目，告诉我可以做什么。',
-                      '帮我设计一个最小实验，先给出方案。',
-                    ].map((x) => (
-                      <button
-                        key={x}
-                        onClick={() => {
-                          updateDraft(x);
-                        }}
-                      >
-                        {x}
-                        <span>↗</span>
-                      </button>
-                    ))}
+        <div className="conversation-frame">
+          <div
+            className="conversation"
+            ref={scroll}
+            onScroll={() => {
+              const e = scroll.current;
+              stick.current = !!e && e.scrollHeight - e.scrollTop - e.clientHeight < 100;
+              updateJump();
+            }}
+          >
+            <div className="conversation-inner">
+              {!thread?.items.length ? (
+                <section className="welcome">
+                  <div className="welcome-symbol">✳</div>
+                  <div className="eyebrow">灵感不必等到回到电脑前</div>
+                  <h1>现在，你想探索什么？</h1>
+                  <p>
+                    说出你的想法，让 Codex 在电脑上
+                    <br className="desktop-only" />
+                    调研、写代码，然后把结果带回来。
+                  </p>
+                  {!thread ? (
+                    <button
+                      className="primary"
+                      disabled={!ready}
+                      onClick={() => (workspace ? create(workspace) : browse())}
+                    >
+                      {workspace ? '在此工作区新建会话' : '选择工作区'} <span>↗</span>
+                    </button>
+                  ) : (
+                    <div className="suggestions">
+                      {[
+                        '先看看这个项目，告诉我可以做什么。',
+                        '帮我设计一个最小实验，先给出方案。',
+                      ].map((x) => (
+                        <button
+                          key={x}
+                          onClick={() => {
+                            updateDraft(x);
+                          }}
+                        >
+                          {x}
+                          <span>↗</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="welcome-note">
+                    <span className="dot online" /> 代码和实验留在你的电脑上
                   </div>
-                )}
-                <div className="welcome-note">
-                  <span className="dot online" /> 代码和实验留在你的电脑上
+                </section>
+              ) : (
+                thread.items.map((i) => <Message key={i.id} item={i} />)
+              )}
+              {thread?.approvals.map((a) => (
+                <ApprovalCard
+                  key={a.id}
+                  approval={a}
+                  respond={(answer) =>
+                    rpc('respond', { threadId: thread.id, requestId: a.id, answer })
+                  }
+                />
+              ))}
+              {thread?.error && (
+                <div role="alert" className="error">
+                  {thread.error}
                 </div>
-              </section>
-            ) : (
-              thread.items.map((i) => <Message key={i.id} item={i} />)
-            )}
-            {thread?.approvals.map((a) => (
-              <ApprovalCard
-                key={a.id}
-                approval={a}
-                respond={(answer) =>
-                  rpc('respond', { threadId: thread.id, requestId: a.id, answer })
-                }
-              />
-            ))}
-            {thread?.error && (
-              <div role="alert" className="error">
-                {thread.error}
-              </div>
-            )}
-            {running && (
-              <div className="working">
-                <span className="spinner" />
-                {thread?.approvals.length ? '等待你的回复' : 'Codex 正在电脑上工作…'}
-              </div>
-            )}
-            {thread?.status === 'interrupted' && (
-              <div className="muted">本轮已停止，可以继续发送消息。</div>
-            )}
+              )}
+              {running && (
+                <div className="working">
+                  <span className="spinner" />
+                  {thread?.approvals.length ? '等待你的回复' : 'Codex 正在电脑上工作…'}
+                </div>
+              )}
+              {thread?.status === 'interrupted' && (
+                <div className="muted">本轮已停止，可以继续发送消息。</div>
+              )}
+            </div>
           </div>
+          {showJump && thread && (
+            <button
+              className="conversation-jump"
+              aria-label={jumpTarget === 'top' ? '跳转到会话顶部' : '跳转到最新消息'}
+              title={jumpTarget === 'top' ? '跳转到会话顶部' : '跳转到最新消息'}
+              onClick={jumpConversation}
+            >
+              <span aria-hidden="true">{jumpTarget === 'top' ? '↑' : '↓'}</span>
+            </button>
+          )}
         </div>
         <div className="composer-area">
           <div className="composer">
@@ -1019,6 +1151,117 @@ function App() {
               </>
             )}
             <small>选择工作区后显示该目录的历史会话；其他目录的任务继续运行。</small>
+          </section>
+        </div>
+      )}
+      {filePicker && (
+        <div className="modal-backdrop">
+          <section
+            className="directory-modal file-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="浏览工作区文件"
+          >
+            <div className="modal-heading">
+              <div>
+                <div className="eyebrow">当前工作区</div>
+                <h2>浏览与下载文件</h2>
+              </div>
+              <button
+                className="icon-button"
+                aria-label="关闭文件浏览"
+                onClick={() => {
+                  ++fileRequest.current;
+                  filePageLoading.current = false;
+                  setFilePicker(false);
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <p
+              className="directory-path"
+              title={workspace + (fileListing?.path ? '/' + fileListing.path : '')}
+            >
+              {workspace}
+              {fileListing?.path ? '/' + fileListing.path : ''}
+            </p>
+            {fileListing?.parent !== null && fileListing && (
+              <button className="back" onClick={() => browseFiles(fileListing.parent || '')}>
+                ← 上一级
+              </button>
+            )}
+            {fileError && (
+              <p className="error" role="alert">
+                {fileError}
+              </p>
+            )}
+            <div
+              className="file-list"
+              ref={fileListRef}
+              onScroll={(event) => {
+                const list = event.currentTarget;
+                if (
+                  fileListing?.nextCursor &&
+                  !filePageLoading.current &&
+                  list.scrollHeight - list.scrollTop - list.clientHeight < 100
+                ) {
+                  void browseFiles(fileListing.path, true);
+                }
+              }}
+            >
+              {fileListing?.entries.map((entry) => (
+                <div className="file-row" key={entry.path}>
+                  {entry.type === 'directory' ? (
+                    <button onClick={() => browseFiles(entry.path)}>
+                      <span className="file-icon">▱</span>
+                      <span className="file-name">{entry.name}</span>
+                      <span aria-hidden="true">›</span>
+                    </button>
+                  ) : (
+                    <>
+                      <div className="file-detail">
+                        <span className="file-icon">▤</span>
+                        <span className="file-name">
+                          {entry.name}
+                          <small>
+                            {fileSize(entry.size)} ·{' '}
+                            {new Date(entry.modifiedMs).toLocaleString('zh-CN')}
+                          </small>
+                        </span>
+                      </div>
+                      <a
+                        href={downloadUrl(entry.path)}
+                        download={entry.name}
+                        aria-label={`下载 ${entry.name}`}
+                      >
+                        下载
+                      </a>
+                    </>
+                  )}
+                </div>
+              ))}
+              {fileListing && !fileListing.entries.length && !fileListing.nextCursor && (
+                <p className="muted">这里没有可下载的文件或可进入的目录。</p>
+              )}
+              {fileLoading && <p className="muted">正在读取文件…</p>}
+              {fileListing?.nextCursor && (
+                <button
+                  className="file-more"
+                  disabled={fileLoading}
+                  onClick={() => browseFiles(fileListing.path, true)}
+                >
+                  加载更多
+                </button>
+              )}
+            </div>
+            <div className="file-footer">
+              <small>
+                已显示 {fileListing?.entries.length || 0} 项
+                {fileListing?.nextCursor ? ' · 在列表内上滑加载更多' : ''}
+              </small>
+              <small>仅显示允许访问的普通文件与目录。</small>
+            </div>
           </section>
         </div>
       )}

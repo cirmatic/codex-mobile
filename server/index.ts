@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { z } from 'zod';
 import { Projects } from './paths.js';
+import { createDownloadPolicy, FileAccessError, FileBrowser } from './files.js';
 import { Codex } from './codex.js';
 import { Sessions } from './sessions.js';
 const root = path.resolve(
@@ -31,6 +32,13 @@ const projects = new Projects(
     .map((s) => path.resolve(s)),
 );
 await projects.init();
+const files = new FileBrowser(
+  projects,
+  createDownloadPolicy(
+    os.homedir(),
+    (process.env.FILE_DOWNLOAD_DENY_PATHS || '').split(path.delimiter).filter(Boolean),
+  ),
+);
 const codex = new Codex();
 const sessions = new Sessions(codex, projects);
 const app = express();
@@ -141,6 +149,51 @@ app.post('/api/directories', async (req, res) => {
     res.json({ path: await projects.create(p.parent, p.name) });
   } catch (e) {
     res.status(400).json({ error: (e as Error).message });
+  }
+});
+function fileError(res: express.Response, error: unknown) {
+  const code = (error as NodeJS.ErrnoException).code;
+  const status =
+    error instanceof FileAccessError
+      ? error.status
+      : code === 'ENOENT'
+        ? 404
+        : code === 'EACCES'
+          ? 403
+          : 400;
+  res.status(status).json({
+    error:
+      error instanceof FileAccessError
+        ? error.message
+        : status === 404
+          ? '文件不存在'
+          : status === 403
+            ? '无法访问此文件'
+            : '文件请求无效',
+  });
+}
+app.get('/api/files', async (req, res) => {
+  try {
+    if (typeof req.query.workspace !== 'string') throw new FileAccessError('请选择工作区');
+    const relative = typeof req.query.path === 'string' ? req.query.path : '';
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : '';
+    res.json(await files.list(req.query.workspace, relative, cursor));
+  } catch (error) {
+    fileError(res, error);
+  }
+});
+app.get('/api/files/download', async (req, res) => {
+  try {
+    if (typeof req.query.workspace !== 'string' || typeof req.query.path !== 'string') {
+      throw new FileAccessError('请选择文件');
+    }
+    const file = await files.download(req.query.workspace, req.query.path);
+    res.download(file.path, file.name, (error) => {
+      if (error && !res.headersSent) fileError(res, error);
+      else if (error) res.destroy(error);
+    });
+  } catch (error) {
+    fileError(res, error);
   }
 });
 app.use(
